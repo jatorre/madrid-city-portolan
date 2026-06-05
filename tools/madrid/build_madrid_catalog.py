@@ -47,6 +47,37 @@ def _ice_field(field, fid):
     return (NestedField(fid, field.name, it, required=False),
             {"id": fid, "name": field.name, "required": False, "type": js})
 
+# Per-column documentation (Iceberg schema field `doc`) — the self-describing place for
+# column metadata, readable by any Iceberg client. Standard geo/index columns get a precise
+# doc; attribute columns get a source-provenance doc.
+_STD_DOC = {
+ "geom": f"Geometry — native geoarrow encoding, CRS {CRS} (ETRS89 / UTM 30N).",
+ "geom_wkb": f"Geometry — WKB encoding, CRS {CRS} (ETRS89 / UTM 30N).",
+ "fp_xmin": "Feature bounding-box minimum X (easting, metres, EPSG:25830) — spatial pruning.",
+ "fp_ymin": "Feature bounding-box minimum Y (northing, metres, EPSG:25830) — spatial pruning.",
+ "fp_xmax": "Feature bounding-box maximum X (easting, metres, EPSG:25830) — spatial pruning.",
+ "fp_ymax": "Feature bounding-box maximum Y (northing, metres, EPSG:25830) — spatial pruning.",
+}
+def _docs(colnames, source_title):
+    d = {}
+    for c in colnames:
+        if c in _STD_DOC: d[c] = _STD_DOC[c]
+        else: d[c] = f"Source attribute '{c}' from «{source_title}» (Ayuntamiento de Madrid)."
+    return d
+def _annotate(meta, docs):
+    for sc in meta.get("schemas", []):
+        for f in sc.get("fields", []):
+            if f.get("name") in docs: f["doc"] = docs[f["name"]]
+    return meta
+def _finalize(mp, docs):
+    """Annotate the staged metadata.json with per-column docs and rewrite it, then return the dict."""
+    meta = _annotate(json.loads(Path(mp).read_text()), docs)
+    Path(mp).write_text(json.dumps(meta))
+    return meta
+def _semprop(info):
+    return {"title": info["title"], "theme": info["theme"], "license": LICENSE, "crs": CRS,
+            "provider": PROVIDER, "semantics": json.dumps(info["semantics"], ensure_ascii=False)}
+
 def _normalize(src):
     """Robust: detect geom column, emit attrs + geom_wkb + per-row fp_* (native CRS)."""
     CONV.mkdir(parents=True, exist_ok=True)
@@ -90,9 +121,10 @@ def _props(title, desc, kws, theme, materialized, status, source=None, semantics
     if semantics: p["semantics"] = semantics
     return p
 
-def build_v2_v3(coll, src, num_rows):
+def build_v2_v3(coll, src, info):
     t = _normalize(src)
     attr = [c for c in t.column_names if c not in ("geom_wkb","fp_xmin","fp_ymin","fp_xmax","fp_ymax")]
+    docs = _docs(list(t.column_names) + ["geom"], info["title"])
     # v2
     v2_cols = attr + ["geom_wkb","fp_xmin","fp_ymin","fp_xmax","fp_ymax"]; v2t = t.select(v2_cols)
     fid = {n:i for i,n in enumerate(v2_cols,1)}; ice=[];fields=[];nm=[]
@@ -107,8 +139,8 @@ def build_v2_v3(coll, src, num_rows):
     df=[{"path":f"data/{coll}.parquet","size":pqp.stat().st_size,"rows":t.num_rows,"lower":lo,"upper":up}]
     v2mp=write_static_catalog(table_root=root,iceberg_schema=Schema(*ice),schema_json_fields=fields,name_mapping=nm,
         data_files=df,format_version_in_metadata=2,location_uri=f"{BASE}/data/v2/{coll}",
-        extra_properties={"geo":json.dumps(geo),"crs":CRS,"provider":PROVIDER})
-    v2_meta=json.loads(Path(v2mp).read_text())
+        extra_properties={"geo":json.dumps(geo), **_semprop(info)})
+    v2_meta=_finalize(v2mp, docs)
     # v3
     v3_cols=attr+["geom"]; fid3={n:i for i,n in enumerate(v3_cols,1)}
     arrays={c:t[c] for c in attr}; arrays["geom"]=GEOM_EXT.wrap_array(t["geom_wkb"].combine_chunks())
@@ -129,10 +161,10 @@ def build_v2_v3(coll, src, num_rows):
           "upper":{g:xy(pc.max(t["fp_xmax"]).as_py(),pc.max(t["fp_ymax"]).as_py())},
           "value_counts":{g:t.num_rows},"null_value_counts":{g:0}}]
     v3mp=write_static_catalog(table_root=root3,iceberg_schema=Schema(*ice),schema_json_fields=fields,name_mapping=nm,
-        data_files=df3,format_version_in_metadata=3,location_uri=f"{BASE}/data/v3/{coll}",extra_properties={"crs":CRS,"provider":PROVIDER})
-    return v2_meta, json.loads(Path(v3mp).read_text())
+        data_files=df3,format_version_in_metadata=3,location_uri=f"{BASE}/data/v3/{coll}",extra_properties=_semprop(info))
+    return v2_meta, _finalize(v3mp, docs)
 
-def build_tab(coll, src):
+def build_tab(coll, src, info):
     t=pq.read_table(src)
     newnames,seen=[],{}
     for n in t.column_names:
@@ -151,8 +183,9 @@ def build_tab(coll, src):
     pq.write_table(t,pqp,compression="zstd")
     df=[{"path":f"data/{coll}.parquet","size":pqp.stat().st_size,"rows":t.num_rows,"lower":{},"upper":{}}]
     mp=write_static_catalog(table_root=root,iceberg_schema=Schema(*ice),schema_json_fields=fields,name_mapping=nm,
-        data_files=df,format_version_in_metadata=2,location_uri=f"{BASE}/data/tab/{coll}",extra_properties={"provider":PROVIDER})
-    return json.loads(Path(mp).read_text()), t.num_rows
+        data_files=df,format_version_in_metadata=2,location_uri=f"{BASE}/data/tab/{coll}",
+        extra_properties={**_semprop(info), "portolan:geospatial":"false"})
+    return _finalize(mp, _docs(cols, info["title"])), t.num_rows
 
 # ---- index schema (same as proof) ----
 # stac-geoparquet index schema (shared) — exec'd into the builder namespace
@@ -252,26 +285,35 @@ def main():
         if done:
             multi=len(coll_layers)>1
             for L in coll_layers:
-                coll=L['collection']; sem={"spec":"Open Semantic Interchange","label":ds['title'],"describes":(ds['description'] or ds['title'])[:300]}
+                coll=L['collection']
+                title=title_for(ds,L,multi); theme=ds['category'] or ds['theme'] or "madrid"
+                sem={"spec":"Open Semantic Interchange","label":ds['title'],
+                     "describes":(ds['description'] or ds['title'])[:300],
+                     "answers":(ds['keywords'][:6] if ds['keywords'] else [])}
+                info=dict(title=title, theme=theme, semantics=sem, description=ds['description'])
+                def _ice_ext(p, ns, m):
+                    p.update({"iceberg:catalog_type":"rest","iceberg:catalog_uri":BASE,
+                              "iceberg:table_id":f"{ns}.{coll}","iceberg:current_snapshot_id":m.get("current-snapshot-id")})
+                    return p
                 try:
                     if L['kind']=='vector':
-                        v2m,v3m=build_v2_v3(coll,L['file'],L.get('rows'))
+                        v2m,v3m=build_v2_v3(coll,L['file'],info)
                         tables+=[("v2",coll,v2m,f"v2/{coll}"),("v3",coll,v3m,f"v3/{coll}")]
                         shutil.copy(L['file'], STAGING/"data"/"parquet"/f"{coll}.parquet")
-                        props=_props(title_for(ds,L,multi),ds['description'],ds['keywords'],ds['category'] or ds['theme'],True,"available",semantics=sem,rows=L.get('rows'))
+                        props=_ice_ext(_props(title,ds['description'],ds['keywords'],theme,True,"available",semantics=sem,rows=L.get('rows')),"v3",v3m)
                         bb=L.get('bbox') or CITY_BBOX
-                        rows.append(dict(id=coll,coll=ds['category'] or ds['theme'] or "madrid",geom=_wkb_box(*bb),bbox=bb,props=props,assets=assets_for([L])))
+                        rows.append(dict(id=coll,coll=theme,geom=_wkb_box(*bb),bbox=bb,props=props,assets=assets_for([L])))
                     elif L['kind']=='raster':
                         shutil.copy(L['file'], STAGING/"data"/"raster"/f"{coll}.tif")
-                        props=_props(title_for(ds,L,multi),ds['description'],ds['keywords'],ds['category'] or ds['theme'],True,"available",semantics=sem)
+                        props=_props(title,ds['description'],ds['keywords'],theme,True,"available",semantics=sem)
                         bb=L.get('bbox') or CITY_BBOX
-                        rows.append(dict(id=coll,coll=ds['category'] or ds['theme'] or "madrid",geom=_wkb_box(*bb),bbox=bb,props=props,assets=assets_for([L])))
+                        rows.append(dict(id=coll,coll=theme,geom=_wkb_box(*bb),bbox=bb,props=props,assets=assets_for([L])))
                     elif L['kind']=='tabular':
-                        tm,nr=build_tab(coll,L['file']); tables.append(("tab",coll,tm,f"tab/{coll}"))
+                        tm,nr=build_tab(coll,L['file'],info); tables.append(("tab",coll,tm,f"tab/{coll}"))
                         shutil.copy(L['file'], STAGING/"data"/"parquet"/f"{coll}.parquet")
-                        props=_props(title_for(ds,L,multi),ds['description'],ds['keywords'],ds['category'] or ds['theme'],True,"available",semantics=sem,rows=nr)
+                        props=_ice_ext(_props(title,ds['description'],ds['keywords'],theme,True,"available",semantics=sem,rows=nr),"tab",tm)
                         props["portolan:geospatial"]=False
-                        rows.append(dict(id=coll,coll=ds['category'] or ds['theme'] or "madrid",geom=None,bbox=None,props=props,assets=assets_for([L])))
+                        rows.append(dict(id=coll,coll=theme,geom=None,bbox=None,props=props,assets=assets_for([L])))
                     nmat+=1
                 except Exception as e:
                     errs.append(f"{coll}: {type(e).__name__}: {str(e)[:160]}")
@@ -291,6 +333,28 @@ def main():
     d=STAGING/"_surface"; d.mkdir(parents=True,exist_ok=True)
     for k,v in surf.items(): (d/(k.replace("/","__")+".json")).write_text(v)
     (STAGING/"_surface_manifest.json").write_text(json.dumps(list(surf.keys()),indent=1))
+    # top-level STAC Catalog with the git-backed-catalog extension + versions.json
+    GIT_EXT="https://portolan-sdi.github.io/git-backed-catalog/v1.0.0/schema.json"
+    REPO="https://github.com/jatorre/madrid-city-portolan"; BUILD_DATE="2026-06-05"
+    cat={"type":"Catalog","stac_version":"1.0.0","id":"madrid-city",
+         "title":"🇪🇸 Ayuntamiento de Madrid (Portolan catalog)",
+         "description":"Cloud-native Portolan catalog of the City of Madrid (geoportal IDEAM), published as a static Apache Iceberg REST catalog + stac-geoparquet index on object storage. Vectors as Iceberg v2/v3 + GeoParquet (native EPSG:25830), rasters as COG, non-spatial as Iceberg tables; every dataset is catalogued (materialized or metadata-only with data_status).",
+         "stac_extensions":[GIT_EXT],
+         "git:repository":REPO,"git:ref":"main","git:provider":"github",
+         "git:edit_url":REPO+"/edit/main/portolan.config.json",
+         "portolan:catalog_type":"iceberg-rest-static","portolan:iceberg_endpoint":BASE,
+         "portolan:datasets":nidx,"portolan:materialized":nmat,"portolan:crs":CRS,
+         "extent":{"spatial":{"bbox":[CITY_BBOX]},"temporal":{"interval":[[None,None]]}},
+         "links":[
+           {"rel":"root","href":f"{BASE}/catalog.json","type":"application/json"},
+           {"rel":"self","href":f"{BASE}/catalog.json","type":"application/json"},
+           {"rel":"vcs","href":REPO,"type":"text/html","title":"Source repository (GitHub)"},
+           {"rel":"issues","href":REPO+"/issues","type":"text/html","title":"Report issues / contribute"},
+           {"rel":"monitor","href":REPO+"/commits/main.atom","type":"application/atom+xml","title":"Commit feed"},
+           {"rel":"service","href":f"{BASE}/v1/config","type":"application/json","title":"Iceberg REST catalog (ATTACH)"},
+           {"rel":"items","href":f"{BASE}/data/catalog/datasets/metadata/v1.metadata.json","type":"application/vnd.apache.iceberg+json","title":"STAC index (stac-geoparquet in Iceberg)"}]}
+    (STAGING/"catalog.json").write_text(json.dumps(cat,ensure_ascii=False,indent=2))
+    (STAGING/"versions.json").write_text(json.dumps({"versions":[{"version":"1.0.0","date":BUILD_DATE,"datasets":nidx,"materialized":nmat}]},indent=2))
     print(f"index rows: {nidx} (materialized layers: {nmat}, metadata-only: {nmeta})")
     print(f"tables in surface: {len(tables)} ; errors: {len(errs)}")
     for e in errs[:25]: print("  ERR", e)

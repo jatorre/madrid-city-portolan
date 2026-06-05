@@ -239,6 +239,15 @@ Results:
   `materialized:false` and a `data_status` (`maintenance` ×9, `metadata_only`, `no_layers`, `extract_failed`,
   `build_error`) plus a `source` link, so it shows in the catalog and can be filled in later.
 
+Metadata completeness (Portolan): each Iceberg table carries full properties (`title`, `theme`, OSI
+`semantics`, `license`, `crs`, `geo`) **and per-column `doc`** (self-describing schema); materialized
+index rows carry the **STAC Iceberg** extension (`iceberg:catalog_uri`/`table_id`/`current_snapshot_id`);
+the root **`catalog.json`** carries the **git-backed-catalog** extension (`git:repository`, vcs/issues/
+monitor links) alongside `versions.json`. Mutable files (surface, metadata, index) are uploaded
+`Cache-Control: no-cache` so in-place overwrites propagate immediately. *(Not generated: the alternate
+per-collection `collection.json` + OGC API-Records file surface — this catalog uses the
+`iceberg-rest-static` model: stac-geoparquet index + Iceberg-REST surface.)*
+
 Re-run anytime (resumable): re-run `fetch_convert.py` (skips done, retries maintenance once the window
 clears) → `build_madrid_catalog.py` → `publish.sh`. Querying the whole catalog (materialized + listed):
 
