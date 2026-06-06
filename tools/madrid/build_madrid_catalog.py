@@ -127,30 +127,9 @@ def build_v2_v3(coll, src, info):
     t = _normalize(src)
     attr = [c for c in t.column_names if c not in ("geom_wkb","fp_xmin","fp_ymin","fp_xmax","fp_ymax")]
     docs = _docs(list(t.column_names) + ["geom"], info["title"])
-    # v2
-    v2_cols = attr + ["geom_wkb","fp_xmin","fp_ymin","fp_xmax","fp_ymax"]; v2t = t.select(v2_cols)
-    fid = {n:i for i,n in enumerate(v2_cols,1)}; ice=[];fields=[];nm=[]
-    for n in v2_cols:
-        nf,jf=_ice_field(v2t.schema.field(n),fid[n]); ice.append(nf);fields.append(jf);nm.append({"field-id":fid[n],"names":[n]})
-    root=STAGING/"data"/"v2"/coll; (root/"data").mkdir(parents=True,exist_ok=True); pqp=root/"data"/f"{coll}.parquet"
-    # Embed GeoParquet 1.1 `geo` file-metadata so the v2 Iceberg data file IS ALSO a valid GeoParquet
-    file_geo={"version":"1.1.0","primary_column":"geom_wkb","columns":{"geom_wkb":{
-        "encoding":"WKB","geometry_types":[],
-        **({"crs":CRS_PROJJSON} if CRS_PROJJSON else {}),
-        "covering":{"bbox":{"xmin":["fp_xmin"],"ymin":["fp_ymin"],"xmax":["fp_xmax"],"ymax":["fp_ymax"]}}}}}
-    v2schema=pa.schema([pa.field(n,v2t.schema.field(n).type,metadata=_fmeta(fid[n])) for n in v2_cols],
-                       metadata={b"geo":json.dumps(file_geo).encode()})
-    v2t=v2t.replace_schema_metadata(None).cast(v2schema)
-    pq.write_table(v2t,pqp,compression="zstd")
-    geo={"version":"1.0","primary_column":"geom_wkb","columns":{"geom_wkb":{"encoding":"WKB","crs":CRS,"edges":"planar","bbox_columns":["fp_xmin","fp_ymin","fp_xmax","fp_ymax"]}}}
-    lo={fid[c]:dle(pc.min(t[c]).as_py()) for c in ("fp_xmin","fp_ymin","fp_xmax","fp_ymax")}
-    up={fid[c]:dle(pc.max(t[c]).as_py()) for c in ("fp_xmin","fp_ymin","fp_xmax","fp_ymax")}
-    df=[{"path":f"data/{coll}.parquet","size":pqp.stat().st_size,"rows":t.num_rows,"lower":lo,"upper":up}]
-    v2mp=write_static_catalog(table_root=root,iceberg_schema=Schema(*ice),schema_json_fields=fields,name_mapping=nm,
-        data_files=df,format_version_in_metadata=2,location_uri=f"{BASE}/data/v2/{coll}",
-        extra_properties={"geo":json.dumps(geo), **_semprop(info)})
-    v2_meta=_finalize(v2mp, docs)
-    # v3
+    # v3 only (native geometry — the DuckDB/Snowflake/CARTO query layer). v2 dropped:
+    # the gpio standalone GeoParquet (data/parquet/) is the download. (geom_wkb-as-GeoParquet-in-v2
+    # conflicts with the Iceberg binary schema in DuckDB's reader.)
     v3_cols=attr+["geom"]; fid3={n:i for i,n in enumerate(v3_cols,1)}
     arrays={c:t[c] for c in attr}; arrays["geom"]=GEOM_EXT.wrap_array(t["geom_wkb"].combine_chunks())
     ice=[];fields=[];nm=[]
@@ -170,8 +149,8 @@ def build_v2_v3(coll, src, info):
           "upper":{g:xy(pc.max(t["fp_xmax"]).as_py(),pc.max(t["fp_ymax"]).as_py())},
           "value_counts":{g:t.num_rows},"null_value_counts":{g:0}}]
     v3mp=write_static_catalog(table_root=root3,iceberg_schema=Schema(*ice),schema_json_fields=fields,name_mapping=nm,
-        data_files=df3,format_version_in_metadata=3,location_uri=f"{BASE}/data/v3/{coll}",extra_properties=_semprop(info))
-    return v2_meta, _finalize(v3mp, docs)
+        data_files=df3,format_version_in_metadata=3,location_uri=f"{BASE}/data/v3/{coll}",extra_properties={"geo":json.dumps({"version":"1.0","primary_column":"geom","columns":{"geom":{"encoding":"geoarrow","crs":CRS}}}), **_semprop(info)})
+    return _finalize(v3mp, docs)
 
 def build_tab(coll, src, info):
     t=pq.read_table(src)
@@ -237,9 +216,8 @@ def assets_for(layers):
     for L in layers:
         c=L['collection']
         if L['kind']=='vector':
-            a["data"]={"href":f"v2.{c}","type":"application/x-iceberg","roles":["data"],"title":"Iceberg v2 (WKB, EPSG:25830)"}
-            a["data_v3"]={"href":f"v3.{c}","type":"application/x-iceberg","roles":["data"],"title":"Iceberg v3 (native geometry, EPSG:25830)"}
-            a["data_parquet"]={"href":f"{BASE}/data/v2/{c}/data/{c}.parquet","type":"application/vnd.apache.parquet","roles":["data"],"title":"GeoParquet (the v2 Iceberg data file — read_parquet / geopandas; EPSG:25830)"}
+            a["data"]={"href":f"v3.{c}","type":"application/x-iceberg","roles":["data"],"title":"Iceberg v3 (native geometry, EPSG:25830) — ATTACH / iceberg_scan in DuckDB/Snowflake/CARTO"}
+            a["data_parquet"]={"href":f"{BASE}/data/parquet/{c}.parquet","type":"application/vnd.apache.parquet","roles":["data"],"title":"Standalone GeoParquet (gpio; correct CRS + bbox) — read_parquet / geopandas / QGIS"}
         elif L['kind']=='raster':
             a["data"]={"href":f"{BASE}/data/raster/{c}.tif","type":"image/tiff; application=geotiff; profile=cloud-optimized","roles":["data"],"title":"Cloud-Optimized GeoTIFF"}
         elif L['kind']=='tabular':
@@ -285,6 +263,7 @@ def main():
     if STAGING.exists(): shutil.rmtree(STAGING)
     if CONV.exists(): shutil.rmtree(CONV)
     (STAGING/"data"/"raster").mkdir(parents=True,exist_ok=True)
+    (STAGING/"data"/"parquet").mkdir(parents=True,exist_ok=True)
     tables=[]; rows=[]; nmat=0; nmeta=0; errs=[]
     for did in MAN_ORDER:
         ds=MAN[did]; st=STATE.get(did)
@@ -305,8 +284,9 @@ def main():
                     return p
                 try:
                     if L['kind']=='vector':
-                        v2m,v3m=build_v2_v3(coll,L['file'],info)
-                        tables+=[("v2",coll,v2m,f"v2/{coll}"),("v3",coll,v3m,f"v3/{coll}")]
+                        v3m=build_v2_v3(coll,L['file'],info)
+                        tables.append(("v3",coll,v3m,f"v3/{coll}"))
+                        shutil.copy(L['file'], STAGING/"data"/"parquet"/f"{coll}.parquet")  # gpio standalone GeoParquet = the download
                         props=_ice_ext(_props(title,ds['description'],ds['keywords'],theme,True,"available",semantics=sem,rows=L.get('rows')),"v3",v3m)
                         bb=L.get('bbox') or CITY_BBOX
                         rows.append(dict(id=coll,coll=theme,geom=_wkb_box(*bb),bbox=bb,props=props,assets=assets_for([L])))
