@@ -1,5 +1,7 @@
 # Portolan catalog template
 
+🌐 **[Explorar el catálogo (visor web) →](https://storage.googleapis.com/carto-portolan-madrid/madrid-city/web/index.html)**
+
 > **Note (2026-06): aligning to the canonical Portolan spec.** A catalog is now a **STAC-profile** directory (`.portolan/` + `catalog.json` + `versions.json` + one `{collection}/` per dataset), built with **`portolan-cli`** (`init`/`add`/`check`) and annotated with the **git-backed-catalog** (`git:`) and **STAC Iceberg** (`iceberg:`) extensions. See `docs-migration-recipe.md` for the exact recipe. The config-driven `tools/*.py` below are the previous generation and are being superseded by `portolan-cli` + extension injection.**
 
 
